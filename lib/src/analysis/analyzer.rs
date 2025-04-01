@@ -3,13 +3,13 @@ use chrono::{DateTime, FixedOffset};
 use serde::Serialize;
 
 use crate::{diag::MessagesContainer, gsmtap_parser};
+use crate::util::RuntimeMetadata;
 
 use super::{
     imsi_requested::ImsiRequestedAnalyzer,
     information_element::InformationElement,
     connection_redirect_downgrade::ConnectionRedirect2GDowngradeAnalyzer,
     priority_2g_downgrade::LteSib6And7DowngradeAnalyzer,
-    null_cipher::NullCipherAnalyzer,
 };
 
 /// Qualitative measure of how severe a Warning event type is.
@@ -73,6 +73,7 @@ pub struct AnalyzerMetadata {
 #[derive(Serialize, Debug)]
 pub struct ReportMetadata {
     pub analyzers: Vec<AnalyzerMetadata>,
+    pub rayhunter: RuntimeMetadata,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -95,11 +96,9 @@ impl AnalysisRow {
 
     pub fn contains_warnings(&self) -> bool {
         for analysis in &self.analysis {
-            for maybe_event in &analysis.events {
-                if let Some(event) = maybe_event {
-                    if matches!(event.event_type, EventType::QualitativeWarning { .. }) {
-                        return true;
-                    }
+            for event in analysis.events.iter().flatten() {
+                if matches!(event.event_type, EventType::QualitativeWarning { .. }) {
+                    return true;
                 }
             }
         }
@@ -109,6 +108,12 @@ impl AnalysisRow {
 
 pub struct Harness {
     analyzers: Vec<Box<dyn Analyzer + Send>>,
+}
+
+impl Default for Harness {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Harness {
@@ -121,7 +126,11 @@ impl Harness {
         harness.add_analyzer(Box::new(ImsiRequestedAnalyzer::new()));
         harness.add_analyzer(Box::new(ConnectionRedirect2GDowngradeAnalyzer{}));
         harness.add_analyzer(Box::new(LteSib6And7DowngradeAnalyzer{}));
-        harness.add_analyzer(Box::new(NullCipherAnalyzer{}));
+
+        // FIXME: our RRC parser is reporting false positives for this due to an
+        // upstream hampi bug (https://github.com/ystero-dev/hampi/issues/133).
+        // once that's fixed, we should regenerate our parser and re-enable this
+        // harness.add_analyzer(Box::new(NullCipherAnalyzer{}));
 
         harness
     }
@@ -205,8 +214,11 @@ impl Harness {
             });
         }
 
+        let rayhunter = RuntimeMetadata::new();
+
         ReportMetadata {
             analyzers,
+            rayhunter,
         }
     }
 }

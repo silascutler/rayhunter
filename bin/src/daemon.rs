@@ -22,6 +22,7 @@ use analysis::{get_analysis_status, run_analysis_thread, start_analysis, Analysi
 use axum::response::Redirect;
 use diag::{get_analysis_report, start_recording, stop_recording, DiagDeviceCtrlMessage};
 use log::{info, error};
+use qmdl_store::RecordingStoreError;
 use rayhunter::diag_device::DiagDevice;
 use axum::routing::{get, post};
 use axum::Router;
@@ -44,24 +45,10 @@ use include_dir::{include_dir, Dir};
 async fn run_server(
     task_tracker: &TaskTracker,
     config: &config::Config,
-    qmdl_store_lock: Arc<RwLock<RecordingStore>>,
+    state: Arc<ServerState>,
     server_shutdown_rx: oneshot::Receiver<()>,
-    ui_update_tx: Sender<framebuffer::DisplayState>,
-    diag_device_sender: Sender<DiagDeviceCtrlMessage>,
-    analysis_sender: Sender<AnalysisCtrlMessage>,
-    analysis_status_lock: Arc<RwLock<AnalysisStatus>>,
 ) -> JoinHandle<()> {
     info!("spinning up server");
-    let state = Arc::new(ServerState {
-        qmdl_store_lock,
-        diag_device_ctrl_sender: diag_device_sender,
-        ui_update_sender: ui_update_tx,
-        debug_mode: config.debug_mode,
-        analysis_status_lock,
-        analysis_sender,
-        colorblind_mode: config.colorblind_mode,
-    });
-
     let app = Router::new()
         .route("/api/pcap/*name", get(get_pcap))
         .route("/api/qmdl/*name", get(get_qmdl))
@@ -90,13 +77,29 @@ async fn server_shutdown_signal(server_shutdown_rx: oneshot::Receiver<()>) {
     info!("Server received shutdown signal, exiting...");
 }
 
-// Loads a QmdlStore if one exists, and if not, only create one if we're not in
-// debug mode.
+// Loads a RecordingStore if one exists, and if not, only create one if we're
+// not in debug mode. If we fail to parse the manifest AND we're not in debug
+// mode, try to recover by making a new (empty) manifest in the same directory.
 async fn init_qmdl_store(config: &config::Config) -> Result<RecordingStore, RayhunterError> {
-    match (RecordingStore::exists(&config.qmdl_store_path).await?, config.debug_mode) {
-        (true, _) => Ok(RecordingStore::load(&config.qmdl_store_path).await?),
-        (false, false) => Ok(RecordingStore::create(&config.qmdl_store_path).await?),
-        (false, true) => Err(RayhunterError::NoStoreDebugMode(config.qmdl_store_path.clone())),
+    let store_exists = RecordingStore::exists(&config.qmdl_store_path).await?;
+    if config.debug_mode {
+        if store_exists {
+            Ok(RecordingStore::load(&config.qmdl_store_path).await?)
+        } else {
+            Err(RayhunterError::NoStoreDebugMode(config.qmdl_store_path.clone()))
+        }
+    } else if store_exists {
+        match RecordingStore::load(&config.qmdl_store_path).await {
+            Ok(store) => Ok(store),
+            Err(RecordingStoreError::ParseManifestError(err)) => {
+                error!("failed to parse QMDL manifest: {}", err);
+                info!("creating new empty manifest...");
+                Ok(RecordingStore::create(&config.qmdl_store_path).await?)
+            },
+            Err(err) => Err(err.into()),
+        }
+    } else {
+        Ok(RecordingStore::create(&config.qmdl_store_path).await?)
     }
 }
 
@@ -195,7 +198,8 @@ fn update_ui(task_tracker: &TaskTracker,  config: &config::Config, mut ui_shutdo
                     fb.draw_line(framebuffer::Color565::Pink, 50);
                     fb.draw_line(framebuffer::Color565::Cyan, 25);
                 },
-                1 | _ => {
+                _ => { // this branch id for ui_level 1, which is also the default if an
+                       // unknown value is used
                     fb.draw_line(display_color, 2);
                 },
             };
@@ -239,7 +243,16 @@ async fn main() -> Result<(), RayhunterError> {
     let analysis_status_lock = Arc::new(RwLock::new(AnalysisStatus::default()));
     run_analysis_thread(&task_tracker, analysis_rx, qmdl_store_lock.clone(), analysis_status_lock.clone(), config.enable_dummy_analyzer);
     run_ctrl_c_thread(&task_tracker, tx.clone(), server_shutdown_tx, maybe_ui_shutdown_tx, qmdl_store_lock.clone(), analysis_tx.clone());
-    run_server(&task_tracker, &config, qmdl_store_lock.clone(), server_shutdown_rx, ui_update_tx, tx, analysis_tx, analysis_status_lock).await;
+    let state = Arc::new(ServerState {
+        qmdl_store_lock: qmdl_store_lock.clone(),
+        diag_device_ctrl_sender: tx,
+        ui_update_sender: ui_update_tx,
+        debug_mode: config.debug_mode,
+        analysis_status_lock,
+        analysis_sender: analysis_tx,
+        colorblind_mode: config.colorblind_mode,
+    });
+    run_server(&task_tracker, &config, state, server_shutdown_rx).await;
 
     task_tracker.close();
     task_tracker.wait().await;
