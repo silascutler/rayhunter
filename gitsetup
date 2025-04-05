@@ -1,0 +1,5 @@
+#!/bin/bash
+
+git remote add upstream https://github.com/EFForg/rayhunter.git
+git fetch upstream
+git merge upstream/main
