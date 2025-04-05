@@ -5,17 +5,21 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::{
     fs::{self, try_exists, File, OpenOptions},
-    io::AsyncWriteExt,
+    io::AsyncWriteExt
 };
 
 #[derive(Debug, Error)]
 pub enum RecordingStoreError {
     #[error("Can't close an entry when there's no current entry")]
     NoCurrentEntry,
+    #[error("An entry with that name doesn't exist")]
+    NoSuchEntryError,
     #[error("Couldn't create file: {0}")]
     CreateFileError(tokio::io::Error),
     #[error("Couldn't read file: {0}")]
     ReadFileError(tokio::io::Error),
+    #[error("Couldn't delete file: {0}")]
+    DeleteFileError(tokio::io::Error),
     #[error("Couldn't open directory at path: {0}")]
     OpenDirError(tokio::io::Error),
     #[error("Couldn't read manifest file: {0}")]
@@ -116,23 +120,20 @@ impl RecordingStore {
     where
         P: AsRef<Path>,
     {
-        let manifest_path = path.as_ref().join("manifest.toml");
         fs::create_dir_all(&path)
             .await
             .map_err(RecordingStoreError::OpenDirError)?;
-        let mut manifest_file = File::create(&manifest_path)
-            .await
-            .map_err(RecordingStoreError::WriteManifestError)?;
-        let empty_manifest = Manifest {
-            entries: Vec::new(),
+
+        let mut store = RecordingStore {
+            path: path.as_ref().to_owned(),
+            manifest: Manifest {
+                entries: Vec::new()
+            },
+            current_entry: None,
         };
-        let empty_manifest_contents =
-            toml::to_string_pretty(&empty_manifest).expect("failed to serialize manifest");
-        manifest_file
-            .write_all(empty_manifest_contents.as_bytes())
-            .await
-            .map_err(RecordingStoreError::WriteManifestError)?;
-        RecordingStore::load(path).await
+
+        store.write_manifest().await?;
+        Ok(store)
     }
 
     async fn read_manifest<P>(path: P) -> Result<Manifest, RecordingStoreError>
@@ -240,17 +241,21 @@ impl RecordingStore {
     }
 
     async fn write_manifest(&mut self) -> Result<(), RecordingStoreError> {
-        let mut manifest_file = File::options()
-            .write(true)
-            .open(self.path.join("manifest.toml"))
+        let tmp_path = self.path.join("manifest.toml.new");
+        let mut manifest_tmp_file = File::create(&tmp_path)
             .await
             .map_err(RecordingStoreError::WriteManifestError)?;
+
         let manifest_contents =
             toml::to_string_pretty(&self.manifest).expect("failed to serialize manifest");
-        manifest_file
+        manifest_tmp_file
             .write_all(manifest_contents.as_bytes())
             .await
             .map_err(RecordingStoreError::WriteManifestError)?;
+
+        fs::rename(tmp_path, self.path.join("manifest.toml")).await
+            .map_err(RecordingStoreError::WriteManifestError)?;
+
         Ok(())
     }
 
@@ -266,6 +271,49 @@ impl RecordingStore {
     pub fn get_current_entry(&self) -> Option<(usize, &ManifestEntry)> {
         let entry_index = self.current_entry?;
         Some((entry_index, &self.manifest.entries[entry_index]))
+    }
+
+    pub async fn delete_entry(&mut self, name: &str) -> Result<ManifestEntry, RecordingStoreError> {
+        let entry_to_delete_idx = self.manifest
+            .entries
+            .iter()
+            .position(|entry| entry.name == name)
+            .ok_or(RecordingStoreError::NoSuchEntryError)?;
+        if let Some(current_entry) = self.current_entry {
+            if current_entry == entry_to_delete_idx {
+                self.close_current_entry().await?;
+            } else {
+                self.current_entry = Some(current_entry - 1);
+            }
+        }
+        let entry_to_delete = self.manifest.entries.remove(entry_to_delete_idx);
+        self.write_manifest().await?;
+        let qmdl_filepath = entry_to_delete.get_qmdl_filepath(&self.path);
+        let analysis_filepath = entry_to_delete.get_analysis_filepath(&self.path);
+        tokio::fs::remove_file(qmdl_filepath)
+            .await
+            .map_err(RecordingStoreError::DeleteFileError)?;
+        tokio::fs::remove_file(analysis_filepath)
+            .await
+            .map_err(RecordingStoreError::DeleteFileError)?;
+        Ok(entry_to_delete)
+    }
+
+    pub async fn delete_all_entries(&mut self) -> Result<(), RecordingStoreError> {
+        self.close_current_entry().await?;
+        for entry in &self.manifest.entries {
+            let qmdl_filepath = entry.get_qmdl_filepath(&self.path);
+            let analysis_filepath = entry.get_analysis_filepath(&self.path);
+            tokio::fs::remove_file(qmdl_filepath)
+                .await
+                .map_err(RecordingStoreError::DeleteFileError)?;
+            tokio::fs::remove_file(analysis_filepath)
+                .await
+                .map_err(RecordingStoreError::DeleteFileError)?;
+        }
+        self.manifest.entries.drain(..);
+        self.write_manifest().await?;
+        Ok(())
     }
 }
 

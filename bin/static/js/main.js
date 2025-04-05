@@ -125,6 +125,16 @@ function createLink(uri, text) {
     return link;
 }
 
+function createButton(uri, text) {
+    const link = document.createElement('button');
+    link.innerText = text;
+    link.onclick = async () => {
+        await req('POST', uri);
+        populateDivs();
+    };
+    return link;
+}
+
 function createEntryRow(entry, isCurrent) {
     const row = document.createElement('tr');
     const name = document.createElement('th');
@@ -153,6 +163,10 @@ function createEntryRow(entry, isCurrent) {
     }
     row.appendChild(analysisResult);
 
+    const actionsButtons = document.createElement('td');
+    actionsButtons.appendChild(createButton(`/api/delete-recording/${entry.name}`, 'Delete'));
+    row.appendChild(actionsButtons);
+
     return row;
 }
 
@@ -170,24 +184,25 @@ async function getSystemStats() {
 async function getQmdlManifest() {
     const manifest = JSON.parse(await req('GET', '/api/qmdl-manifest'));
     if (manifest.current_entry) {
-        manifest.current_entry.status = STATUS_NEEDS_UPDATE;
-        manifest.current_entry.analysis_result = 'Waiting...';
-        manifest.current_entry.start_time = new Date(manifest.current_entry.start_time);
-        if (manifest.current_entry.last_message_time === undefined) {
-            manifest.current_entry.last_message_time = "N/A";
-        } else {
-            manifest.current_entry.last_message_time = new Date(manifest.current_entry.last_message_time);
-        }
+        parseQmdlEntry(manifest.current_entry);
     }
     for (entry of manifest.entries) {
-        entry.status = STATUS_NEEDS_UPDATE;
-        entry.analysis_result = 'Waiting...';
-        entry.start_time = new Date(entry.start_time);
-        entry.last_message_time = new Date(entry.last_message_time);
+        parseQmdlEntry(entry);
     }
     // sort them in reverse chronological order
     manifest.entries.reverse();
     return manifest;
+}
+
+function parseQmdlEntry(entry) {
+    entry.status = STATUS_NEEDS_UPDATE;
+    entry.analysis_result = 'Waiting...';
+    entry.start_time = new Date(entry.start_time);
+    if (entry.last_message_time === null) {
+        entry.last_message_time = "N/A";
+    } else {
+        entry.last_message_time = new Date(entry.last_message_time);
+    }
 }
 
 async function startRecording() {
@@ -198,6 +213,13 @@ async function startRecording() {
 async function stopRecording() {
     await req('POST', '/api/stop-recording');
     populateDivs();
+}
+
+async function deleteAllRecodings() {
+    if (window.confirm("Are you sure you want to permanently delete all of your recordings?")) {
+        await req('POST', '/api/delete-all-recordings');
+        populateDivs();
+    }
 }
 
 async function req(method, url) {
